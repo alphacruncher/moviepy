@@ -496,6 +496,8 @@ class FFmpegInfosParser:
 
                 # exit chapter
                 if self._current_chapter:
+                    if not input_chapters:
+                        input_chapters.append([])
                     input_chapters[input_number].append(self._current_chapter)
                     self._current_chapter = None
 
