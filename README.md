@@ -43,7 +43,7 @@ final_video.write_videofile("result.mp4")
 
 # How MoviePy works
 
-Under the hood, MoviePy imports media (video frames, images, sounds) and converts them into Python objects (numpy arrays) so that every pixel becomes accessible, and video or audio effects can be defined in just a few lines of code (see the [built-in effects]() for examples).
+Under the hood, MoviePy imports media (video frames, images, sounds) and converts them into Python objects (numpy arrays) so that every pixel becomes accessible, and video or audio effects can be defined in just a few lines of code (see the [built-in effects](https://zulko.github.io/moviepy/reference/reference/moviepy.video.fx.html) for examples).
 
 The library also provides ways to mix clips together (concatenations, playing clips side by side or on top of each other with transparency, etc.). The final clip is then encoded back into mp4/webm/gif/etc.
 
@@ -56,7 +56,7 @@ Intall moviepy with `pip install moviepy`. For additional installation options, 
 
 # Documentation
 
-The online documentation ([here](https://zulko.github.io/moviepy/)) is automatically built at every push to the master branch. To build the documentation locally, install the extra dependencies via `pip install moviepy[doc]`, then go to the `docs` folder and run `make html`.
+The online documentation ([here](https://zulko.github.io/moviepy/)) is automatically built at every push to the master branch. To build the documentation locally, install the extra dependencies via `pip install "moviepy[doc]"`, then go to the `docs` folder and run `make html`.
 
 # Contribute
 

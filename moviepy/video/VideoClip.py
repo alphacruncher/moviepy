@@ -8,7 +8,7 @@ import copy as _copy
 import os
 import threading
 from numbers import Real
-from typing import TYPE_CHECKING, Callable, List, Union
+from typing import TYPE_CHECKING, Callable, List, Tuple, Union
 
 import numpy as np
 import proglog
@@ -496,8 +496,8 @@ class VideoClip(Clip):
         loop : int, optional
           Repeat the clip using ``loop`` iterations in the resulting GIF.
 
-        progress_bar
-          If True, displays a progress bar
+        logger
+          Either ``"bar"`` for progress bar or ``None`` or any Proglog logger.
 
 
         Notes
@@ -717,7 +717,9 @@ class VideoClip(Clip):
             post_array = np.hstack((post_array, x_1))
         return post_array
 
-    def compose_on(self, background: Image.Image, t) -> Image.Image:
+    def compose_on(
+        self, background: np.ndarray, t, background_mask: Union[np.ndarray, None] = None
+    ) -> Tuple[np.ndarray, Union[np.ndarray, None]]:
         """Returns the result of the clip's frame at time `t` on top
         on the given `picture`, the position of the clip being given
         by the clip's ``pos`` attribute. Meant for compositing.
@@ -725,73 +727,179 @@ class VideoClip(Clip):
         If the clip/backgrounds have transparency the transparency will
         be accounted for.
 
-        The return is a Pillow Image
+        The return is either a numpy array for image with no transparency or
+        a tuple (image, mask) for image with transparency
 
         Parameters
         ----------
-        backrgound (Image)
+        background: (np.ndarray)
           The background image to apply current clip on top of
           if the background image is transparent it must be given as a RGBA image
 
-        t
+        t: (float)
           The time of clip to apply on top of clip
 
+        background_mask: (np.ndarray|None), default None
+          The background mask to apply current clip on top of
+          if the background image is transparent it must be given as a mask
+          if None, the background is assumed to be fully opaque
+
+
         Return
+        -------
+        (np.ndarray, np.ndarray|None)
+          A tuple with the new image and a mask if applicable, or None
+
+
         """
         ct = t - self.start  # clip time
 
         # GET IMAGE AND MASK IF ANY
         clip_frame = self.get_frame(ct).astype("uint8")
-        clip_img = Image.fromarray(clip_frame)
+        background_height, background_width = background.shape[:2]
+        clip_height, clip_width = clip_frame.shape[:2]
+        clip_mask = None
 
         if self.mask is not None:
-            clip_mask = (self.mask.get_frame(ct) * 255).astype("uint8")
-            clip_mask_img = Image.fromarray(clip_mask).convert("L")
+            # Clip mask normalize to 0 (fully transparent) to 1 (fully opaque)
+            clip_mask = self.mask.get_frame(ct)
 
             # Resize clip_mask_img to match clip_img, always use top left corner
-            if clip_mask_img.size != clip_img.size:
-                mask_width, mask_height = clip_mask_img.size
-                img_width, img_height = clip_img.size
+            if clip_frame.shape[:2] != clip_mask.shape[:2]:
+                mask_height, mask_width = clip_mask.shape[:2]
 
-                if mask_width > img_width or mask_height > img_height:
-                    # Crop mask if it is larger
-                    clip_mask_img = clip_mask_img.crop((0, 0, img_width, img_height))
-                else:
-                    # Fill mask with 0 if it is smaller
-                    new_mask = Image.new("L", (img_width, img_height), 0)
-                    new_mask.paste(clip_mask_img, (0, 0))
-                    clip_mask_img = new_mask
+                # If mask is larger, crop it
+                if mask_width > clip_width or mask_height > clip_height:
+                    clip_mask = clip_mask[:clip_height, :clip_width]
 
-            clip_img = clip_img.convert("RGBA")
-            clip_img.putalpha(clip_mask_img)
+                # If mask is smaller, fill it with zeros
+                if mask_width < clip_width or mask_height < clip_height:
+                    new_mask = np.zeros(
+                        (clip_height, clip_width), dtype=clip_mask.dtype
+                    )
+                    new_mask[:mask_height, :mask_width] = clip_mask
+                    clip_mask = new_mask
 
         # SET POSITION
         pos = self.pos(ct)
-        pos = compute_position(clip_img.size, background.size, pos, self.relative_pos)
+        x_start, y_start = compute_position(
+            (clip_width, clip_height),
+            (background_width, background_height),
+            pos,
+            self.relative_pos,
+        )
 
-        # If neither background nor clip have alpha layer (check if mode end
-        # with A), we can juste use pillow paste
-        if clip_img.mode[-1] != "A" and background.mode[-1] != "A":
-            background.paste(clip_img, pos)
-            return background
+        # Clip destination coordinates in bg
+        y1_bg = max(y_start, 0)
+        y2_bg = min(y_start + clip_height, background_height)
+        x1_bg = max(x_start, 0)
+        x2_bg = min(x_start + clip_width, background_width)
 
-        # For images with transparency we must use pillow alpha composite
-        # instead of a simple paste, because pillow paste dont work nicely
-        # with alpha compositing
-        if background.mode[-1] != "A":
-            background = background.convert("RGBA")
+        # Corresponding source region in clip
+        y1_clip = max(-y_start, 0)
+        y2_clip = y1_clip + (y2_bg - y1_bg)
+        x1_clip = max(-x_start, 0)
+        x2_clip = x1_clip + (x2_bg - x1_bg)
 
-        if clip_img.mode[-1] != "A":
-            clip_img = clip_img.convert("RGBA")
+        # We will ignore any mask with no transparency so we only ever compute mask
+        # if really necessary
+        if background_mask is not None and np.min(background_mask) == 1:
+            background_mask = None
 
-        # We need both image to do the same size for alpha compositing in pillow
-        # so we must start by making a fully transparent canvas of background's
-        # size and paste our clip img into it in position pos, only then can we
-        # composite this canvas on top of background
-        canvas = Image.new("RGBA", (background.width, background.height), (0, 0, 0, 0))
-        canvas.paste(clip_img, pos)
-        result = Image.alpha_composite(background, canvas)
-        return result
+        if clip_mask is not None and np.min(clip_mask) == 1:
+            clip_mask = None
+
+        # Copy the background to avoid modifying the original
+        bg_copy = background.copy()
+
+        if background_mask is not None:
+            bg_mask_copy = background_mask.copy()
+
+        # If neither background nor clip have a mask, we can just paste clip on top
+        if background_mask is None and clip_mask is None:
+            bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = clip_frame[
+                y1_clip:y2_clip, x1_clip:x2_clip
+            ]
+            return (bg_copy, None)
+
+        # If clip has no alpha layer, we can compute final clip
+        # by replacing the background region with the clip region
+        # and fill the region mask with 1
+        if clip_mask is None:
+            bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = clip_frame[
+                y1_clip:y2_clip, x1_clip:x2_clip
+            ]
+            bg_mask_copy[y1_bg:y2_bg, x1_bg:x2_bg] = np.ones(
+                (y2_bg - y1_bg, x2_bg - x1_bg), dtype=np.float32
+            )
+            return (bg_copy, bg_mask_copy)
+
+        # If background has no alpha layer, we can compute final color
+        # accounting for transparency and return a result with no transparency
+        if background_mask is None:
+            # Extract regions, convert to float32 instead of letting numpy go for float64
+            frame = clip_frame[y1_clip:y2_clip, x1_clip:x2_clip].astype(np.float32)
+            bg = bg_copy[y1_bg:y2_bg, x1_bg:x2_bg].astype(np.float32)
+            alpha = clip_mask[y1_clip:y2_clip, x1_clip:x2_clip][..., None].astype(
+                np.float32
+            )
+
+            # To understand the math, think in "passing light" (see self.compose_mask)
+            # if first layer is 100% opacity with 100 red photons, 0 green, 0 blue [100, 0, 0]
+            # and second layer is 70% opacity, with 0 red photons, 0 green, 100 blue [0, 0, 100]
+            # then we got 100 red, but 70% are blocked, so we get 100 - 100*0.7 = 30 red
+            # and we also get 100 blue, of which only 70% are "emited", so we get 100*0.7 = 70 blue
+            # we get a final [30, 0, 70] fully opaque sheet
+            result = frame * alpha + bg * (1 - alpha)
+
+            # Finally we update the regions with result back to int
+            bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = result.astype(np.uint8)
+            return (bg_copy, None)
+
+        # For images with alpha layer on both clip and background
+        # we must compute both new color and new mask
+        # Again to understand the math, consider the following to calculate the final mask
+        # Note :
+        # Thinking in transparency is hard, as we tend to think
+        # that 50% opaque + 40% opaque = 90% opacity, when it really its 70%
+        # It's a lot easier to think in terms of "passing light"
+        # Consider I emit 100 photons, and my first layer is 50% opaque, meaning it
+        # will "stop" 50% of the photons, I'll have 50 photons left
+        # now my second layer is blocking 40% of thoses 50 photons left
+        # blocking 50 * 0.4 = 20 photons, and leaving me with only 30 photons
+        # So, by adding two layer of 50% and 40% opacity my finaly opacity is only
+        # of (100-30)*100 = 70% opacity !
+        # the formula for final alpha is for B over A is : opacity B + opacity A * (1 - opacity B)
+
+        # We can understand the formula by thinking that a color with X% opacity will only emit color * X photons :
+        # B will emit 100 photons multiply by B opacity, so if opacity is 25%, 25 photons will pass
+        # It will also let pass the photons emitted by A, (100 * A opacity), for A = 50, 50 photons
+        # but of thoses 50, 25% will be blocked, so 50 - (50 * 0.25) = 50 * 0.75 = 37.5
+        # so at the end we get 25 + 37.5 = 62.5 photons, so the same as a one layer opacity of 62.5%
+        # so, how many photon B will let through + (how many photon A will let through * how many of thouse B will let through)
+        # again we get aB + aA * (1 - aB)
+        # at the end we must divide color by resulting alpha to keep true colors
+
+        # Extract regions, convert to float32 instead of letting numpy go for float64
+        frame = clip_frame[y1_clip:y2_clip, x1_clip:x2_clip].astype(np.float32)
+        bg = bg_copy[y1_bg:y2_bg, x1_bg:x2_bg].astype(np.float32)
+        alpha_clip = clip_mask[y1_clip:y2_clip, x1_clip:x2_clip].astype(np.float32)
+        alpha_bg = background_mask[y1_bg:y2_bg, x1_bg:x2_bg].astype(np.float32)
+
+        # Ensure alpha channels have the right shape for broadcasting
+        if alpha_clip.ndim == 2:
+            alpha_clip = alpha_clip[..., None]
+        if alpha_bg.ndim == 2:
+            alpha_bg = alpha_bg[..., None]
+
+        final_alpha = alpha_clip + alpha_bg * (1 - alpha_clip)
+        safe_alpha = np.where(final_alpha == 0, 1.0, final_alpha)
+        result = (frame * alpha_clip + bg * alpha_bg * (1 - alpha_clip)) / safe_alpha
+
+        bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = np.round(result).astype(np.uint8)
+
+        bg_mask_copy[y1_bg:y2_bg, x1_bg:x2_bg] = final_alpha.squeeze()
+        return (bg_copy, bg_mask_copy)
 
     def compose_mask(self, background_mask: np.ndarray, t: float) -> np.ndarray:
         """Returns the result of the clip's mask at time `t` composited
@@ -817,26 +925,24 @@ class VideoClip(Clip):
 
         # SET POSITION
         pos = self.pos(ct)
-        pos = compute_position((clip_w, clip_h), (bg_w, bg_h), pos, self.relative_pos)
+        x_start, y_start = compute_position(
+            (clip_w, clip_h), (bg_w, bg_h), pos, self.relative_pos
+        )
 
-        # ALPHA COMPOSITING
-        # Determine the base_mask region to merge size
-        x_start = int(max(pos[0], 0))  # Dont go under 0 left
-        x_end = int(min(pos[0] + clip_w, bg_w))  # Dont go over base_mask width
-        y_start = int(max(pos[1], 0))  # Dont go under 0 top
-        y_end = int(min(pos[1] + clip_h, bg_h))  # Dont go over base_mask height
+        # Clip destination coordinates in bg
+        y1_bg = max(y_start, 0)
+        y2_bg = min(y_start + clip_h, bg_h)
+        x1_bg = max(x_start, 0)
+        x2_bg = min(x_start + clip_w, bg_w)
 
-        # Determine the clip_mask region to overlapp
-        # Dont go under 0 for horizontal, if we have negative margin of X px start at X
-        # And dont go over clip width
-        clip_x_start = int(max(0, -pos[0]))
-        clip_x_end = int(clip_x_start + min((x_end - x_start), (clip_w - clip_x_start)))
-        # same for vertical
-        clip_y_start = int(max(0, -pos[1]))
-        clip_y_end = int(clip_y_start + min((y_end - y_start), (clip_h - clip_y_start)))
+        # Corresponding source region in clip
+        y1_clip = max(-y_start, 0)
+        y2_clip = y1_clip + (y2_bg - y1_bg)
+        x1_clip = max(-x_start, 0)
+        x2_clip = x1_clip + (x2_bg - x1_bg)
 
         # Blend the overlapping regions
-        # The calculus is base_opacity + clip_opacity * (1 - base_opacity)
+        # The calculus is clip_opacity + bg_opacity * (1 - base_opacity)
         # this ensure that masks are drawn in the right order and
         # the contribution of each mask is proportional to their transparency
         #
@@ -850,13 +956,17 @@ class VideoClip(Clip):
         # blocking 50 * 0.4 = 20 photons, and leaving me with only 30 photons
         # So, by adding two layer of 50% and 40% opacity my finaly opacity is only
         # of (100-30)*100 = 70% opacity !
-        background_mask[y_start:y_end, x_start:x_end] = background_mask[
-            y_start:y_end, x_start:x_end
-        ] + clip_mask[clip_y_start:clip_y_end, clip_x_start:clip_x_end] * (
-            1 - background_mask[y_start:y_end, x_start:x_end]
+
+        # Copy the background mask to avoid modifying the original
+        b = background_mask.copy()
+
+        b[y1_bg:y2_bg, x1_bg:x2_bg] = clip_mask[
+            y1_clip:y2_clip, x1_clip:x2_clip
+        ] + background_mask[y1_bg:y2_bg, x1_bg:x2_bg] * (
+            1 - clip_mask[y1_clip:y2_clip, x1_clip:x2_clip]
         )
 
-        return background_mask
+        return b
 
     def with_background_color(self, size=None, color=(0, 0, 0), pos=None, opacity=None):
         """Place the clip on a colored background.
@@ -1310,6 +1420,11 @@ class ImageClip(VideoClip):
       Set this parameter to `True` (default) if you want the alpha layer
       of the picture (if it exists) to be used as a mask.
 
+    duration
+      Duration of the clip in seconds. If not provided, the clip will
+      have infinite duration (i.e. it will be displayed until the end of the
+      composition in which it is included).
+
     Attributes
     ----------
 
@@ -1318,9 +1433,7 @@ class ImageClip(VideoClip):
 
     """
 
-    def __init__(
-        self, img, is_mask=False, transparent=True, fromalpha=False, duration=None
-    ):
+    def __init__(self, img, is_mask=False, transparent=True, duration=None):
         VideoClip.__init__(self, is_mask=is_mask, duration=duration)
 
         if not isinstance(img, np.ndarray):
@@ -1329,9 +1442,7 @@ class ImageClip(VideoClip):
 
         if len(img.shape) == 3:  # img is (now) a RGB(a) numpy array
             if img.shape[2] == 4:
-                if fromalpha:
-                    img = 1.0 * img[:, :, 3] / 255
-                elif is_mask:
+                if is_mask:
                     img = 1.0 * img[:, :, 0] / 255
                 elif transparent:
                     self.mask = ImageClip(1.0 * img[:, :, 3] / 255, is_mask=True)
@@ -1440,9 +1551,9 @@ class ColorClip(ImageClip):
                 )
             shape = (h, w, len(color))
 
-        super().__init__(
-            np.tile(color, w * h).reshape(shape), is_mask=is_mask, duration=duration
-        )
+        arr = np.tile(color, w * h).reshape(shape)
+        arr = arr.astype(np.float32) if is_mask else arr.astype(np.uint8)
+        super().__init__(arr, is_mask=is_mask, duration=duration)
 
 
 class TextClip(ImageClip):
@@ -1504,7 +1615,7 @@ class TextClip(ImageClip):
       Either :
         - 'label' (default), the picture will be autosized so as to fit the text
           either by auto-computing font size if width is provided or auto-computing
-          width and eight if font size is defined
+          width and height if font size is defined
 
         - 'caption' the text will be drawn in a picture with fixed size provided
           with the ``size`` argument. The text will be wrapped automagically,
@@ -1544,11 +1655,11 @@ class TextClip(ImageClip):
       letters with accents), and bellow standard baseline (e.g letters such as
       p, y, g).
 
-      This notion is knowned under the name ascent and descent meaning the
-      highest and lowest pixel above and below baseline
+      This notion is known under the name "ascent" and "descent" meaning the
+      highest and lowest pixel above and below the baseline.
 
-      If your first line dont have an "accent character" and your last line
-      dont have a "descent character", you'll have some "fat" arround
+      If your first line doesn't have an "accent character" and your last line
+      doesn't have a "descent character", you'll have some "fat" around.
     """
 
     @convert_path_to_string("filename")
@@ -1575,7 +1686,11 @@ class TextClip(ImageClip):
         if font is not None:
             try:
                 _ = ImageFont.truetype(font)
-            except Exception as e:
+            except TypeError as e:
+                if "takes no arguments" in str(e):
+                    pil_font = ImageFont.load_default()
+                else:
+                    raise
                 raise ValueError(
                     "Invalid font {}, pillow failed to use it with error {}".format(
                         font, e
@@ -1704,7 +1819,12 @@ class TextClip(ImageClip):
         if font:
             pil_font = ImageFont.truetype(font, font_size)
         else:
-            pil_font = ImageFont.load_default(font_size)
+            try:
+                # Only Pillow >= 10.1.0, can set font size
+                pil_font = ImageFont.load_default(font_size)
+            except TypeError:
+                pil_font = ImageFont.load_default()
+
         draw = ImageDraw.Draw(img)
 
         # Dont need allow break here, because we already breaked in caption
@@ -1774,7 +1894,12 @@ class TextClip(ImageClip):
         if font:
             font_pil = ImageFont.truetype(font, font_size)
         else:
-            font_pil = ImageFont.load_default(font_size)
+            try:
+                # Only Pillow >= 10.1.0, can set font size
+                font_pil = ImageFont.load_default(font_size)
+            except TypeError:
+                font_pil = ImageFont.load_default()
+
         draw = ImageDraw.Draw(img)
 
         lines = []
@@ -1907,17 +2032,36 @@ class TextClip(ImageClip):
         )
 
         # For height calculate manually as textbbox is not realiable
-        try:
-            # this disappeared in more recent versions of Pillow
-            line_height = draw._multiline_spacing(font_pil, spacing, stroke_width)
-            line_breaks = text.count("\n")
-            lines_height = line_breaks * line_height
-            paddings = real_font_size + stroke_width * 2
-            height = int(lines_height + paddings)
-        except AttributeError:
-            height = int(bottom - top)
+        line_height = self.__multiline_spacing(draw, font_pil, spacing, stroke_width)
+        line_breaks = text.count("\n")
+        lines_height = line_breaks * line_height
+        paddings = real_font_size + stroke_width * 2
+        height = int(lines_height + paddings)
 
         return (int(right - left), height)
+
+    def __multiline_spacing(
+        self,
+        draw: ImageDraw.ImageDraw,
+        font: Union[
+            ImageFont.ImageFont, ImageFont.FreeTypeFont, ImageFont.TransposedFont
+        ],
+        spacing: float,
+        stroke_width: float,
+    ) -> float:
+        """Calculate the spacing between lines for multiline text.
+
+        This method is used to calculate the height of each line in a multiline
+        text block, taking into account the font metrics, spacing, and stroke width.
+
+        This is a dropped-in replacement for the deprecated
+        `ImageDraw._multiline_spacing` method in Pillow.
+        """
+        return (
+            draw.textbbox((0, 0), "A", font, stroke_width=stroke_width)[3]
+            + stroke_width
+            + spacing
+        )
 
     def __find_optimum_font_size(
         self,
@@ -2052,7 +2196,7 @@ class BitmapClip(VideoClip):
             output_frame = []
             for row in input_frame:
                 output_frame.append([self.color_dict[color] for color in row])
-            frame_list.append(np.array(output_frame))
+            frame_list.append(np.array(output_frame, dtype=np.uint8))
 
         frame_array = np.array(frame_list)
         self.total_frames = len(frame_array)

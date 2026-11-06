@@ -3,12 +3,13 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
+requires-python=">=3.9"
 name = "moviepy"
-version = "2.2.1"
+version = "2.2.0"
 description = "Video editing with Python"
 readme = "README.md"
 license = { text = "MIT License" }
-authors = [{ name = "Zulko 2024" }]
+authors = [{ name = "Zulko 2025" }]
 keywords = ["video", "editing", "audio", "compositing", "ffmpeg"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -19,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Multimedia :: Sound/Audio :: Analysis",
@@ -33,7 +35,8 @@ dependencies = [
     "numpy>=1.25.0",
     "proglog<=1.0.0",
     "python-dotenv>=0.10",
-    "pillow>=9.2.0,<12.0",
+    "pillow>=9.2.0",
+    "opencv-python-headless>=4.0.0",
 ]
 
 [project.optional-dependencies]
